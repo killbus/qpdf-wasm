@@ -16,7 +16,7 @@ export LDFLAGS="-L$OUT_DIR/lib"
 export PKG_CONFIG_PATH="$OUT_DIR/lib/pkgconfig"
 export EM_PKG_CONFIG_PATH="$PKG_CONFIG_PATH"
 export CFLAGS="$EMCC_FLAGS_RELEASE"
-export CXXFLAGS="$CFLAGS"
+export CXXFLAGS="$CFLAGS"  # No -fexceptions needed
 
 mkdir -p "$OUT_DIR"
 
@@ -38,16 +38,21 @@ emmake make -j install
 
 cd "$ROOT/lib/qpdf"
 fn_git_clean
+# Standardize exports using generator script
 emcmake cmake -S . -B build \
   -DCMAKE_INSTALL_PREFIX="$OUT_DIR" \
   -DRANDOM_DEVICE="/dev/random"
 
-# `-j` needs to be adjusted manually
-# setting to `nproc` crashes my system
-cmake --build build -j 4
+echo "Generating export configuration..."
+node "$ROOT/build/generate-exports.mjs" "$ROOT/build" --qpdf-include "$ROOT/lib/qpdf/include/qpdf"
+
+# Adjust parallelism based on available processors
+cmake --build build -j $(nproc)
 
 mkdir -p "$ROOT/dist"
 
+# emcc Options:
+# -s DISABLE_EXCEPTION_CATCHING=0  # Not needed - no C++ exceptions used
 emcc \
   $LDFLAGS \
   $CPPFLAGS \
@@ -58,9 +63,11 @@ emcc \
   --post-js "$ROOT/js/post.js" \
   -s WASM_BIGINT=1 \
   -s ALLOW_MEMORY_GROWTH=1 \
-  -s EXPORTED_RUNTIME_METHODS='["callMain","FS","NODEFS","WORKERFS","ENV"]' \
-  -s INCOMING_MODULE_JS_API='["noInitialRun","noFSInit","locateFile","preRun"]' \
   -s NO_DISABLE_EXCEPTION_CATCHING=1 \
+  -s EXPORTED_FUNCTIONS="@$ROOT/build/exported-functions.txt" \
+  -s EXPORTED_RUNTIME_METHODS="@$ROOT/build/exported-runtime-methods.txt" \
+  -s INCOMING_MODULE_JS_API="@$ROOT/build/exported-incoming-methods.txt" \
+  -s ALLOW_TABLE_GROWTH=1 \
   -s MODULARIZE=1 \
   -o "$ROOT/dist/qpdf.js" \
   "$ROOT/lib/qpdf/build/libqpdf/libqpdf.a" \
