@@ -1,0 +1,108 @@
+name: 'Resolve Upstream QPDF Version'
+description: 'Determines which upstream QPDF version to build from killbus/qpdf'
+
+inputs:
+  build-type:
+    description: 'Build type: stable, prerelease, or latest'
+    required: true
+    default: 'latest'
+
+  version-override:
+    description: 'Override version (tag/branch/commit). If provided, ignores build-type.'
+    required: false
+    default: ''
+
+  github-token:
+    description: 'GitHub token for API calls'
+    required: true
+    default: ${{ github.token }}
+
+outputs:
+  ref:
+    description: 'Git ref to checkout (tag, branch, or commit)'
+    value: ${{ steps.resolve.outputs.ref }}
+
+  version:
+    description: 'Cleaned version string for tagging/naming'
+    value: ${{ steps.resolve.outputs.version }}
+
+  commit-sha:
+    description: 'Full commit SHA for provenance'
+    value: ${{ steps.resolve.outputs.commit_sha }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Resolve upstream version
+      id: resolve
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        BUILD_TYPE: ${{ inputs.build-type }}
+        VERSION_OVERRIDE: ${{ inputs.version-override }}
+      run: |
+        set -euo pipefail
+
+        echo "::group::Resolving upstream QPDF version"
+
+        REPO_URL="https://github.com/killbus/qpdf.git"
+
+        # If version override is provided, use it directly
+        if [ -n "$VERSION_OVERRIDE" ]; then
+          echo "Using version override: $VERSION_OVERRIDE"
+          echo "ref=$VERSION_OVERRIDE" >> $GITHUB_OUTPUT
+          echo "version=$VERSION_OVERRIDE" >> $GITHUB_OUTPUT
+
+          COMMIT_SHA=$(git ls-remote $REPO_URL "$VERSION_OVERRIDE" | awk '{print $1}')
+          # If ls-remote fails to find specific ref, it might be a raw commit hash or local assumption
+          if [ -z "$COMMIT_SHA" ]; then
+             # If it looks like a SHA, use it. Otherwise assume it's a valid reference that git will resolve later.
+             COMMIT_SHA="$VERSION_OVERRIDE"
+          fi
+          echo "commit_sha=$COMMIT_SHA" >> $GITHUB_OUTPUT
+
+          echo "::endgroup::"
+          exit 0
+        fi
+
+        echo "Performing partial clone to fetch Git metadata..."
+        rm -rf qpdf_bare
+        git clone --filter=blob:none --bare $REPO_URL qpdf_bare
+
+        cd qpdf_bare
+
+        case "$BUILD_TYPE" in
+          latest)
+            echo "Resolving latest commit from main branch..."
+            RESOLVED_TAG="main"
+            COMMIT_SHA=$(git rev-parse HEAD)
+            COMMIT_DATE=$(date -u +"%Y.%m.%d")
+            VERSION_STRING="nightly-$COMMIT_DATE"
+
+            echo "ref=$RESOLVED_TAG" >> $GITHUB_OUTPUT
+            echo "version=$VERSION_STRING" >> $GITHUB_OUTPUT
+            echo "commit_sha=$COMMIT_SHA" >> $GITHUB_OUTPUT
+
+            echo "Resolved to main branch (commit: ${COMMIT_SHA:0:7})"
+            echo "::endgroup::"
+            exit 0
+            ;;
+
+          *)
+            # For now, default everything else to main/latest logic as we don't have stable tags policy for this fork yet
+            echo "::warning::Build type $BUILD_TYPE not strictly implemented, defaulting to main branch."
+            echo "Resolving latest commit from main branch..."
+            RESOLVED_TAG="main"
+            COMMIT_SHA=$(git rev-parse HEAD)
+            COMMIT_DATE=$(date -u +"%Y.%m.%d")
+            VERSION_STRING="nightly-$COMMIT_DATE"
+
+            echo "ref=$RESOLVED_TAG" >> $GITHUB_OUTPUT
+            echo "version=$VERSION_STRING" >> $GITHUB_OUTPUT
+            echo "commit_sha=$COMMIT_SHA" >> $GITHUB_OUTPUT
+
+            echo "Resolved to main branch (commit: ${COMMIT_SHA:0:7})"
+            echo "::endgroup::"
+            exit 0
+            ;;
+        esac

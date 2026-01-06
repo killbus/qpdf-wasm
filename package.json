@@ -1,5 +1,5 @@
 {
-  "name": "@neslinesli93/qpdf-wasm",
+  "name": "@killbus/qpdf-wasm",
   "version": "0.3.0",
   "description": "QPDF compiled to WASM",
   "main": "dist/qpdf.js",
@@ -17,7 +17,7 @@
   "dependencies": {},
   "repository": {
     "type": "git",
-    "url": "https://github.com/neslinesli93/qpdf-wasm.git"
+    "url": "https://github.com/killbus/qpdf-wasm.git"
   },
-  "homepage": "https://github.com/neslinesli93/qpdf-wasm"
+  "homepage": "https://github.com/killbus/qpdf-wasm"
 }

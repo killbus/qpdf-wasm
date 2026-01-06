@@ -1,0 +1,143 @@
+name: QPDF WASM Build
+
+on:
+  push:
+    branches:
+      - "*"
+  workflow_call:
+
+jobs:
+  build:
+    concurrency: build-${{ github.ref }}
+    runs-on: ubuntu-24.04
+    env:
+      EMSDK: /opt/emsdk
+      EM_CACHE: /opt/emsdk/upstream/emscripten/cache
+      EM_CONFIG: /opt/emsdk/.emscripten
+      QPDF_REPO_URL: https://github.com/killbus/qpdf
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ============ Cache Strategy ============
+      - name: Restore Emscripten SDK cache
+        id: cache-emsdk
+        uses: actions/cache/restore@v4
+        with:
+          path: /opt/emsdk
+          key: emsdk-3.1.74-${{ runner.os }}-v1
+
+      # ============ System Dependencies ============
+      - name: Install base system packages
+        run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            pkg-config autoconf automake libtool ragel git yasm \
+            subversion lsb-release tzdata tini \
+            curl build-essential rsync python3 python3-pip
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/*
+
+      # ============ Emscripten SDK ============
+      - name: Install Emscripten SDK 3.1.74
+        if: steps.cache-emsdk.outputs.cache-hit != 'true'
+        run: |
+          sudo mkdir -p /opt/emsdk
+          sudo chown $USER:$USER /opt/emsdk
+          git clone --depth 1 https://github.com/emscripten-core/emsdk.git /opt/emsdk
+          cd /opt/emsdk
+          ./emsdk install 3.1.74 --shallow
+          ./emsdk activate 3.1.74
+
+      - name: Setup Emscripten environment
+        run: |
+          cd /opt/emsdk
+          source ./emsdk_env.sh
+
+          # Add to PATH
+          echo "/opt/emsdk" >> $GITHUB_PATH
+          echo "/opt/emsdk/upstream/emscripten" >> $GITHUB_PATH
+          echo "/opt/emsdk/upstream/bin" >> $GITHUB_PATH
+
+          # Export env vars
+          echo "EMSDK=$EMSDK" >> $GITHUB_ENV
+          echo "EM_CONFIG=$EM_CONFIG" >> $GITHUB_ENV
+
+          # Verify
+          emcc --version
+
+      # ============ Upstream Version ============
+      - name: Resolve upstream version
+        id: resolve
+        uses: ./.github/actions/resolve-upstream-version
+        with:
+          build-type: latest
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # ============ Build ============
+      - name: Build QPDF WASM
+        env:
+          QPDF_VERSION: ${{ steps.resolve.outputs.commit-sha }}
+        run: |
+          # The build.sh script needs to be able to find the source code
+          # Our Dockerfile clones it, here we need to do it or let build.sh do it?
+          # build.sh assumes code is in lib/zlib etc.
+          # The Dockerfile runs shallow-clone.sh. We need to match that.
+
+          mkdir -p lib
+
+          # Clone dependencies (matching Dockerfile logic but modifying for native)
+          # We need shallow-clone.sh or just run git clone
+
+          chmod +x shallow-clone.sh
+
+          # zlib
+          ./shallow-clone.sh https://github.com/madler/zlib.git lib/zlib 21767c654d31d2dccdde4330529775c6c5fd5389
+
+          # jpeg-turbo
+          ./shallow-clone.sh https://github.com/ImageMagick/jpeg-turbo.git lib/jpeg-turbo 7aa2a898c564041a24b09d0a6e780aaa632d08d3
+
+          # qpdf (using resolved version)
+          ./shallow-clone.sh $QPDF_REPO_URL.git lib/qpdf ${{ steps.resolve.outputs.commit-sha }}
+
+          bash build.sh
+
+          # Match Dockerfile logic: copy type definitions to dist
+          cp types/qpdf.d.ts dist/qpdf.d.ts
+
+      # ============ Artifacts ============
+      - name: Generate build info
+        run: |
+          mkdir -p dist
+          echo '{
+            "build_mode": "release",
+            "build_timestamp": "'$(date -u +"%Y-%m-%dT%H:%M:%SZ")'",
+            "qpdf_commit": "'${{ steps.resolve.outputs.commit-sha }}'",
+            "qpdf_repo": "'$QPDF_REPO_URL'",
+            "source_commit": "'$GITHUB_SHA'",
+            "git_ref": "'$GITHUB_REF'",
+            "workflow_run_number": "'$GITHUB_RUN_NUMBER'"
+          }' > dist/build-info.json
+
+      - name: Tests
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: |
+          yarn
+          yarn test
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: node-app
+          path: ./dist
+
+      # ============ Save Cache ============
+      - name: Save Emscripten SDK cache
+        uses: actions/cache/save@v4
+        if: always() && steps.cache-emsdk.outputs.cache-hit != 'true'
+        with:
+          path: /opt/emsdk
+          key: emsdk-3.1.74-${{ runner.os }}-v1

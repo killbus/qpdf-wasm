@@ -1,0 +1,226 @@
+name: Release to Git Branch and Create GitHub Release
+
+on:
+  workflow_run:
+    workflows: ["QPDF WASM Build"]
+    types:
+      - completed
+    branches:
+      - master 
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  release:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          run-id: ${{ github.event.workflow_run.id }}
+          pattern: node-app
+          path: artifacts/
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install pnpm
+        run: npm install -g pnpm
+
+      - name: Install dependencies
+        run: pnpm install
+
+      - name: Process release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+
+          # v4 with pattern: artifact contents are extracted directly to path/
+          # However, download-artifact@v4 with pattern puts each artifact in its own subdir
+          ARTIFACT_DIR="artifacts/node-app"
+
+          # Verify build-info.json exists
+          BUILD_INFO="$ARTIFACT_DIR/build-info.json"
+          if [ ! -f "$BUILD_INFO" ]; then
+             # Fallback check if it was flattened
+             if [ -f "artifacts/build-info.json" ]; then
+                ARTIFACT_DIR="artifacts"
+                BUILD_INFO="artifacts/build-info.json"
+             else
+                echo "::error::build-info.json not found in $ARTIFACT_DIR or artifacts/"
+                find artifacts -maxdepth 3
+                exit 1
+             fi
+          fi
+
+          BUILD_MODE=$(jq -r '.build_mode' "$BUILD_INFO")
+          BUILD_TIMESTAMP=$(jq -r '.build_timestamp' "$BUILD_INFO")
+          QPDF_COMMIT=$(jq -r '.qpdf_commit' "$BUILD_INFO")
+          QPDF_REPO=$(jq -r '.qpdf_repo' "$BUILD_INFO")
+          SOURCE_COMMIT=$(jq -r '.source_commit' "$BUILD_INFO")
+          GIT_REF=$(jq -r '.git_ref' "$BUILD_INFO")
+          RUN_NUMBER=$(jq -r '.workflow_run_number' "$BUILD_INFO")
+
+          SHORT_SOURCE_COMMIT=${SOURCE_COMMIT:0:7}
+          SHORT_QPDF_COMMIT=${QPDF_COMMIT:0:7}
+          # Use package.json version as base
+          BASE_VERSION=$(jq -r .version package.json)
+          VERSION="${BASE_VERSION}-${SHORT_QPDF_COMMIT}"
+
+          echo "Processing build:"
+          echo "  Version: $VERSION"
+          echo "  Build Mode: $BUILD_MODE"
+          echo "  Upstream QPDF Commit: $QPDF_COMMIT"
+          echo "  Source Commit: $SOURCE_COMMIT"
+
+          if [[ "$GIT_REF" == "refs/heads/master" ]]; then
+            BRANCH_NAME="release"
+            TAG_NAME="v${VERSION}"
+            IS_PRERELEASE="false"
+          else
+            BRANCH_NAME="release-dev"
+            TAG_NAME="${VERSION}-dev"
+            IS_PRERELEASE="true"
+          fi
+
+          echo "Branch: $BRANCH_NAME"
+          echo "Tag: $TAG_NAME"
+
+          # Delete existing release/tag FIRST, so we can replace it cleanly
+          echo "Deleting existing release/tag $TAG_NAME if it exists..."
+          gh release delete "$TAG_NAME" -y --cleanup-tag || true
+          # Also ensure remote tag is gone (if release didn't exist but tag did)
+          git push origin --delete "$TAG_NAME" || true
+
+          RELEASE_TEMP="release_temp"
+          rm -rf "$RELEASE_TEMP"
+          mkdir -p "$RELEASE_TEMP/dist"
+
+          # Copy artifacts to release temp / dist
+          # The artifact contains the build outputs (js, wasm, d.ts) flattened
+          if [ -d "$ARTIFACT_DIR/dist" ]; then
+             cp -r "$ARTIFACT_DIR/dist"/* "$RELEASE_TEMP/dist/"
+          else
+             cp -r "$ARTIFACT_DIR"/* "$RELEASE_TEMP/dist/"
+          fi
+
+          if [ -f "package.json" ]; then
+            cp package.json "$RELEASE_TEMP/"
+          fi
+          if [ -f "README.md" ]; then
+            cp README.md "$RELEASE_TEMP/"
+          fi
+
+          (
+            cd "$RELEASE_TEMP"
+            # Remove build-info.json if it was copied (it's internal metadata)
+            rm -f dist/build-info.json || true
+
+            git init
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+
+            git checkout -b "$BRANCH_NAME"
+
+            if [ -f "package.json" ]; then
+              PKG_VER="${VERSION#v}"
+              npm version "$PKG_VER" --no-git-tag-version --allow-same-version || true
+            fi
+
+            git add .
+
+            # Commit with heredoc for better readability
+            git commit -F- <<EOF
+          chore: release qpdf-wasm build
+
+          Build Mode: ${BUILD_MODE}
+          Version: ${VERSION}
+          Upstream QPDF Commit: ${QPDF_COMMIT}
+          Source Commit: ${SOURCE_COMMIT}
+          Timestamp: ${BUILD_TIMESTAMP}
+          EOF
+
+            git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
+            git push --force origin "$BRANCH_NAME"
+
+            # Force update the tag to point to this new artifact commit
+            echo "Pushing tag $TAG_NAME to point to artifact commit..."
+            git tag --force "$TAG_NAME"
+            git push --force origin "$TAG_NAME"
+          )
+
+          PRERELEASE_FLAG=""
+          if [ "$IS_PRERELEASE" == "true" ]; then
+            PRERELEASE_FLAG="--prerelease"
+          fi
+
+          TITLE="qpdf-wasm $VERSION"
+
+          # Create release with heredoc for notes
+          gh release create "$TAG_NAME" \
+            $PRERELEASE_FLAG \
+            --title "$TITLE" \
+            --notes-file - <<EOF
+          # qpdf-wasm Build
+
+          **Build Mode:** \`${BUILD_MODE}\`
+          **Upstream QPDF Commit:** [\`${SHORT_QPDF_COMMIT}\`](${QPDF_REPO}/commit/${QPDF_COMMIT})
+          **Build Time:** \`${BUILD_TIMESTAMP}\`
+
+          ## Installation
+
+          ### Method 1: Install from Git
+          \`\`\`bash
+          npm install github:${{ github.repository }}#${TAG_NAME}
+          \`\`\`
+
+          ### Method 2: Download tarball
+          Download \`qpdf-wasm-${VERSION}.tar.gz\` from release assets.
+
+          Built from commit [${SHORT_SOURCE_COMMIT}](https://github.com/${{ github.repository }}/commit/${SOURCE_COMMIT})
+          EOF
+
+          # Create tarball from release temp
+          echo "Creating release tarball..."
+          TARBALL_NAME="qpdf-wasm-${VERSION}.tar.gz"
+          tar -czf "$TARBALL_NAME" \
+            --exclude='.git' \
+            -C "$RELEASE_TEMP" .
+
+          echo "Uploading release tarball..."
+          gh release upload "$TAG_NAME" "$TARBALL_NAME"
+
+          echo "✅ Release $TAG_NAME published successfully"
+
+          # ============ Cleanup Old Releases ============
+
+          # Define retention policy
+          if [ "$IS_PRERELEASE" == "true" ]; then
+             KEEP_COUNT=10
+             MATCH_REGEX="\-dev$"
+             echo "Cleaning up old dev releases (keeping last $KEEP_COUNT)..."
+          else
+             KEEP_COUNT=20
+             MATCH_REGEX="^v"
+             echo "Cleaning up old stable releases (keeping last $KEEP_COUNT)..."
+          fi
+
+          # List releases, filter by type, sort by date desc, skip kept count, delete rest
+          gh release list --limit 100 --json tagName,createdAt --jq 'sort_by(.createdAt) | reverse | .[].tagName' \
+            | grep -E "$MATCH_REGEX" \
+            | tail -n +$((KEEP_COUNT + 1)) \
+            | while read -r DELETE_TAG; do
+                echo "Deleting old release: $DELETE_TAG"
+                gh release delete "$DELETE_TAG" -y --cleanup-tag || echo "Failed to delete $DELETE_TAG"
+            done

@@ -1,4 +1,4 @@
-declare module "@neslinesli93/qpdf-wasm" {
+declare module "@killbus/qpdf-wasm" {
   interface QpdfModule {
     ({ locateFile }: { locateFile: () => string }): Promise<QpdfInstance>;
   }
